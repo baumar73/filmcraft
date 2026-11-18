@@ -12,6 +12,8 @@
 //!
 //! The MPEG-TS test checks a linked ripple trim and the exported picture and sound.
 //!
+//! The MPEG-PS test checks a linked ripple trim and the exported picture and sound.
+//!
 //! The media is generated with ffmpeg into `target/fixtures/cli/workflows` at test time (never
 //! committed); without ffmpeg the tests skip (`FILMCRAFT_REQUIRE_ORACLES=1` makes that a failure).
 //! ffmpeg and ffprobe are external test oracles only.
@@ -503,6 +505,68 @@ fn mpeg_transport_stream_ripple_trim_to_h264() {
         .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=3"])
         .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3"])
         .args(["-c:v", "mpeg2video", "-c:a", "mp2", "-ac", "2", "-f", "mpegts"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(fixture.status.success(), "fixture: {}", String::from_utf8_lossy(&fixture.stderr));
+
+    let mut m = Mcp::start(&dir.path("data"));
+    let imported = m.tool("media_import", json!({"paths": [source]}));
+    assert_eq!(imported["errors"], json!([]), "{imported}");
+    let item = imported["items"][0].as_u64().unwrap();
+    let made = m.run("file.newSequenceFromClip", json!({"items": [item]}));
+    assert_eq!(made["clips"].as_array().map(Vec::len), Some(2), "{made}");
+
+    let initial = m.tool("sequence_inspect", json!({}));
+    assert_eq!(initial["settings"]["frame_rate"], json!({"num": 25, "den": 1}));
+    let clip = &clips_on(&initial, "video", 0)[0];
+    assert_eq!(clip["endFrame"], 75, "three seconds at 25 fps");
+    let video = clip["clip"].as_u64().unwrap();
+    let source_in = |clip: &Value| clip["sourceIn"].as_i64().unwrap();
+    let initial_audio = source_in(&clips_on(&initial, "audio", 0)[0]);
+    let trim = 12;
+    let remaining = 75u64 - trim;
+    m.run("timeline.trim", json!({"clip": video, "edge": "in", "mode": "ripple", "deltaFrames": trim}));
+    let edited = m.tool("sequence_inspect", json!({}));
+    let linked = &clips_on(&edited, "audio", 0)[0];
+    assert_eq!(linked["startFrame"], 0, "{linked}");
+    assert_eq!(linked["endFrame"], remaining, "{linked}");
+    let video_shift = source_in(&clips_on(&edited, "video", 0)[0]) - source_in(clip);
+    assert!(video_shift > 0, "the trim advances the source position");
+    assert_eq!(source_in(linked) - initial_audio, video_shift, "linked audio follows the video trim");
+
+    let out = dir.path("edit.mp4");
+    let export = m.run("file.exportMedia", json!({"path": out, "format": "h264", "range": "entire", "gpuRendering": "off", "wait": true}));
+    assert_eq!(export["result"]["frames"], remaining, "{export}");
+    assert_eq!(export["offlineMedia"], json!([]), "{export}");
+
+    let info = probe(&ffprobe, &out);
+    let (video, audio) = (streams(&info, "video"), streams(&info, "audio"));
+    assert_eq!((video.len(), audio.len()), (1, 1), "{info}");
+    assert_eq!(video[0]["codec_name"], "h264", "{info}");
+    assert_eq!(audio[0]["codec_name"], "aac", "{info}");
+    assert_eq!(video[0]["nb_read_frames"], remaining.to_string(), "{info}");
+    let input = frames(&ffmpeg, &source, None, "gray");
+    let edited = frames(&ffmpeg, &out, None, "gray");
+    assert_eq!(input.len(), 75);
+    assert_eq!(edited.len(), remaining as usize);
+    assert_shows(&edited[0], &input, trim as usize, "first frame after ripple trim");
+    assert_shows(&edited[10], &input, trim as usize + 10, "later frame after ripple trim");
+    assert_shows(edited.last().unwrap(), &input, 74, "last frame after ripple trim");
+    let audio = pcm(&ffmpeg, &out, 0);
+    assert!(tone(&audio, 0.5, 440.0) > 0.02, "the source tone survives the export");
+}
+
+/// MPEG-PS: import a synthetic MPEG-2/MP2 clip, ripple-trim it, and check the exported edit.
+#[test]
+fn mpeg_program_stream_ripple_trim_to_h264() {
+    let (ffmpeg, ffprobe) = filmcraft_testkit::require_oracles!();
+    let dir = Scratch::new("mpeg-program");
+    let source = dir.path("source.vob");
+    let fixture = Command::new(&ffmpeg)
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=3"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3"])
+        .args(["-c:v", "mpeg2video", "-c:a", "mp2", "-ac", "2", "-f", "vob"])
         .arg(&source)
         .output()
         .unwrap();
